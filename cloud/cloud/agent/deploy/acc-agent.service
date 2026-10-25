@@ -1,0 +1,25 @@
+[Unit]
+Description=ACC Shooter dedicated-server agent
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/acc-agent.env
+ExecStart=/usr/bin/python3 /opt/acc/agent.py \
+    --api-url $API_URL \
+    --region $AWS_REGION \
+    --public-address $PUBLIC_ADDRESS \
+    --game-port $GAME_PORT \
+    --capacity $CAPACITY \
+    --server-binary $SERVER_BINARY \
+    --loopback-port $AGENT_PORT \
+    --heartbeat-interval $HEARTBEAT_INTERVAL \
+    --log-file $SERVER_LOG
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+User=root
+
+[Install]
+WantedBy=multi-user.target

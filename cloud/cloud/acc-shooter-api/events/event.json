@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "routeKey": "GET /config",
+  "rawPath": "/config",
+  "rawQueryString": "",
+  "headers": {},
+  "requestContext": {
+    "http": {
+      "method": "GET",
+      "path": "/config",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "127.0.0.1",
+      "userAgent": "local-test"
+    }
+  },
+  "isBase64Encoded": false
+}

@@ -1,0 +1,39 @@
+# Unity generated files
+**/Library/
+**/Temp/
+**/Obj/
+**/obj/
+**/Logs/
+**/.vs/
+**/UserSettings/
+**/Builds/
+**/WindowsClientTest/
+**/WindowsClientDevTest/
+*.csproj
+*.sln
+*.suo
+*.user
+
+# Python
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# AWS SAM generated output
+**/.aws-sam/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+!.env.sample
+.aws/
+*credentials*
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

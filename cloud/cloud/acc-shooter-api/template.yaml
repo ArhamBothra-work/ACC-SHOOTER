@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ACC Shooter backend
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 20
+    MemorySize: 512
+    Architectures:
+      - x86_64
+  HttpApi:
+    Auth:
+      EnableIamAuthorizer: true
+
+Parameters:
+  PlayersTableName:
+    Type: String
+    Default: Players
+  RoomsTableName:
+    Type: String
+    Default: Rooms
+  ServersTableName:
+    Type: String
+    Default: Servers
+  JoinTicketsTableName:
+    Type: String
+    Default: JoinTickets
+  ReservationsTableName:
+    Type: String
+    Default: Reservations
+  MatchesTableName:
+    Type: String
+    Default: Matches
+  ConfigTableName:
+    Type: String
+    Default: Config
+  EnableMatchmaking:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+  EnableLeaderboard:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+Resources:
+  AccShooterApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - content-type
+          - authorization
+          - idempotency-key
+          - x-amz-date
+          - x-amz-security-token
+          - x-amz-content-sha256
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 300
+
+  BackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: hello_world/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          PLAYERS_TABLE: !Ref PlayersTable
+          ROOMS_TABLE: !Ref RoomsTable
+          TICKETS_TABLE: !Ref JoinTicketsTable
+          SERVERS_TABLE: !Ref ServersTable
+          RESERVATIONS_TABLE: !Ref ReservationsTable
+          MATCHES_TABLE: !Ref MatchesTable
+          MATCHMAKING_ENABLED: !Ref EnableMatchmaking
+          LEADERBOARD_ENABLED: !Ref EnableLeaderboard
+          SERVER_ROLE_NAME: !Sub '${AWS::StackName}-GameServerAgentRole'
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt RoomsTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt ServersTable.Arn
+                - !Sub '${ServersTable.Arn}/index/*'
+                - !GetAtt JoinTicketsTable.Arn
+                - !GetAtt ReservationsTable.Arn
+                - !Sub '${ReservationsTable.Arn}/index/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt MatchesTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !Sub '${PlayersTable.Arn}/index/leaderboard-v2-index'
+      Events:
+        GetConfig:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /config
+            Method: GET
+        CreateGuestRoom:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /guest/rooms
+            Method: POST
+        JoinGuestRoom:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /guest/rooms/{code}/join
+            Method: POST
+        GuestQuickplay:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /guest/quickplay
+            Method: POST
+        GuestTicketStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /guest/tickets/status
+            Method: POST
+        RegisterGameServer:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /internal/servers/register
+            Method: POST
+            Auth:
+              Authorizer: AWS_IAM
+        GameServerHeartbeat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /internal/servers/heartbeat
+            Method: POST
+            Auth:
+              Authorizer: AWS_IAM
+        ConsumeJoinTicket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /internal/tickets/consume
+            Method: POST
+            Auth:
+              Authorizer: AWS_IAM
+        ReleaseServerSlot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /internal/servers/reservations/{reservationId}/release
+            Method: POST
+            Auth:
+              Authorizer: AWS_IAM
+        SubmitMatchResults:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /internal/matches/{matchId}/results
+            Method: POST
+            Auth:
+              Authorizer: AWS_IAM
+        GetLeaderboard:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AccShooterApi
+            Path: /leaderboard
+            Method: GET
+
+  GameServerAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GameServerAgentRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeTrustedGameServerRoutes
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AccShooterApi}/$default/POST/internal/servers/register'
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AccShooterApi}/$default/POST/internal/servers/heartbeat'
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AccShooterApi}/$default/POST/internal/tickets/consume'
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AccShooterApi}/$default/POST/internal/servers/reservations/*/release'
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${AccShooterApi}/$default/POST/internal/matches/*/results'
+
+  GameServerAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref GameServerAgentRole
+
+  PlayersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref PlayersTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: kills
+          AttributeType: N
+        - AttributeName: leaderboardShard
+          AttributeType: S
+        - AttributeName: leaderboardSort
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: leaderboard-index
+          KeySchema:
+            - AttributeName: kills
+              KeyType: HASH
+            - AttributeName: userId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: leaderboard-v2-index
+          KeySchema:
+            - AttributeName: leaderboardShard
+              KeyType: HASH
+            - AttributeName: leaderboardSort
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - displayName
+              - kills
+              - deaths
+
+  MatchesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref MatchesTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: matchId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: matchId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  RoomsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref RoomsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: roomCode
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: roomCode
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ServersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ServersTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: serverId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: region
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serverId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: region-status-index
+          KeySchema:
+            - AttributeName: region
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  JoinTicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref JoinTicketsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ReservationsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reservationId
+          AttributeType: S
+        - AttributeName: serverId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reservationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: server-status-index
+          KeySchema:
+            - AttributeName: serverId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ConfigTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: configKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: configKey
+          KeyType: HASH
+
+Outputs:
+  ApiUrl:
+    Description: ACC Shooter HTTP API URL
+    Value: !Sub 'https://${AccShooterApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  GameServerAgentRoleArn:
+    Description: IAM role used by the trusted dedicated-server agent
+    Value: !GetAtt GameServerAgentRole.Arn
+  GameServerAgentInstanceProfileName:
+    Description: Instance profile name to attach to future dedicated-server EC2 instances
+    Value: !Ref GameServerAgentInstanceProfile

@@ -1,0 +1,1110 @@
+import base64
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import re
+import secrets
+import string
+import time
+import uuid
+from decimal import Decimal
+
+import boto3
+from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
+
+from matchmaking import (
+    IdempotencyConflict,
+    ReservationNotFound,
+    ReservationUnavailable,
+    cached_reservation_response,
+    consume_join_ticket,
+    reap_expired_reservations,
+    release_reservation,
+    reserve_server_and_issue_ticket,
+    ticket_status,
+)
+
+
+LOG = logging.getLogger()
+LOG.setLevel(logging.INFO)
+
+ROOM_TTL_SECONDS = 6 * 60 * 60
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+ROOM_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
+TICKET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
+GENERATION_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+SERVER_ID_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
+DNS_NAME_PATTERN = re.compile(
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+SERVER_HEARTBEAT_SECONDS = 90
+SERVER_TTL_SECONDS = 30 * 24 * 60 * 60
+LEADERBOARD_SHARDS = 16
+
+_dynamodb = None
+_tables = {}
+
+
+class ApiError(Exception):
+    def __init__(self, status, code, message, retryable=False, **details):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.details = details
+
+
+def _table(name):
+    global _dynamodb
+    if name not in _tables:
+        if _dynamodb is None:
+            _dynamodb = boto3.resource("dynamodb")
+        env_names = {
+            "rooms": "ROOMS_TABLE",
+            "players": "PLAYERS_TABLE",
+            "tickets": "TICKETS_TABLE",
+            "servers": "SERVERS_TABLE",
+            "reservations": "RESERVATIONS_TABLE",
+            "matches": "MATCHES_TABLE",
+        }
+        table_name = os.environ.get(env_names[name])
+        if not table_name:
+            raise RuntimeError(f"Missing required environment variable {env_names[name]}")
+        _tables[name] = _dynamodb.Table(table_name)
+    return _tables[name]
+
+
+def response(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+        },
+        "body": json.dumps(
+            body,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=_json_default,
+        ),
+    }
+
+
+def _json_default(value):
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return int(value)
+    raise TypeError(f"Unsupported JSON value: {type(value).__name__}")
+
+
+def _error(status, code, message, retryable=False, **details):
+    body = {
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        }
+    }
+    if details:
+        body["error"]["details"] = details
+    return response(status, body)
+
+
+def _request_id(event):
+    context = event.get("requestContext") or {}
+    http_context = context.get("http") or {}
+    return context.get("requestId") or http_context.get("requestId")
+
+
+def _body_object(event):
+    raw = event.get("body")
+    if raw in (None, ""):
+        return {}
+    if event.get("isBase64Encoded"):
+        try:
+            raw = base64.b64decode(raw, validate=True).decode("utf-8")
+        except (TypeError, ValueError, UnicodeDecodeError):
+            raise ApiError(400, "invalid_json", "Request body must be valid UTF-8 JSON.")
+    try:
+        body = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        raise ApiError(400, "invalid_json", "Request body must be valid JSON.")
+    if not isinstance(body, dict):
+        raise ApiError(400, "invalid_request", "Request body must be a JSON object.")
+    return body
+
+
+def _strict_fields(body, allowed):
+    unknown = sorted(set(body) - set(allowed))
+    if unknown:
+        raise ApiError(
+            400,
+            "unknown_fields",
+            "Request contains unsupported fields.",
+            fields=unknown,
+        )
+
+
+def _idempotency_key(event):
+    headers = event.get("headers") or {}
+    value = next(
+        (v for k, v in headers.items() if k.lower() == "idempotency-key"),
+        None,
+    )
+    if not isinstance(value, str) or not IDEMPOTENCY_PATTERN.fullmatch(value):
+        raise ApiError(
+            400,
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain 16-128 URL-safe characters.",
+        )
+    return value
+
+
+def _idempotency_record_key(key):
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return "REQUEST#" + digest
+
+
+def _payload_hash(operation, payload):
+    serialized = json.dumps(
+        {"operation": operation, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _integer(value):
+    if type(value) is int:
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return int(value)
+    return None
+
+
+def leaderboard_index_fields(user_id, kills, deaths):
+    if (
+        not isinstance(user_id, str)
+        or not user_id
+        or type(kills) is not int
+        or not 0 <= kills <= 999_999_999_999
+        or type(deaths) is not int
+        or not 0 <= deaths <= 999_999_999_999
+    ):
+        raise ValueError("Invalid leaderboard key fields.")
+    shard = int(hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8], 16) % LEADERBOARD_SHARDS
+    return {
+        "leaderboardShard": f"SHARD#{shard:02d}",
+        "leaderboardSort": f"{kills:012d}#{999_999_999_999 - deaths:012d}#{user_id}",
+    }
+
+
+def _get_idempotent_response(key, request_hash, now):
+    result = _table("rooms").get_item(
+        Key={"roomCode": _idempotency_record_key(key)},
+        ConsistentRead=True,
+    )
+    item = result.get("Item")
+    if not item:
+        return None
+    expires_at = _integer(item.get("expiresAt"))
+    if expires_at is not None and expires_at <= now:
+        raise ApiError(
+            409,
+            "idempotency_key_expired",
+            "This Idempotency-Key has expired. Use a new key.",
+        )
+    if item.get("requestHash") != request_hash:
+        raise ApiError(
+            409,
+            "idempotency_conflict",
+            "This Idempotency-Key was already used with a different request.",
+        )
+    cached = item.get("response")
+    if not isinstance(cached, dict):
+        raise RuntimeError("Stored idempotency record has no valid response.")
+    return cached
+
+
+def _serialize_item(item):
+    from boto3.dynamodb.types import TypeSerializer
+
+    serializer = TypeSerializer()
+    return {key: serializer.serialize(value) for key, value in item.items()}
+
+
+def make_room_code():
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def create_room(event, body, now=None):
+    _strict_fields(body, {"maxPlayers", "killLimit"})
+    max_players = body.get("maxPlayers", 10)
+    kill_limit = body.get("killLimit", 30)
+    if type(max_players) is not int or not 2 <= max_players <= 10:
+        raise ApiError(400, "invalid_max_players", "maxPlayers must be an integer from 2 to 10.")
+    if type(kill_limit) is not int or not 1 <= kill_limit <= 200:
+        raise ApiError(400, "invalid_kill_limit", "killLimit must be an integer from 1 to 200.")
+
+    key = _idempotency_key(event)
+    now = int(time.time()) if now is None else int(now)
+    request_hash = _payload_hash(
+        "create-room",
+        {"maxPlayers": max_players, "killLimit": kill_limit},
+    )
+    cached = _get_idempotent_response(key, request_hash, now)
+    if cached is not None:
+        return response(201, cached)
+
+    expires_at = now + ROOM_TTL_SECONDS
+    request_record_key = _idempotency_record_key(key)
+    client = _table("rooms").meta.client
+
+    for _ in range(5):
+        code = make_room_code()
+        room = {
+            "roomCode": code,
+            "status": "waiting_for_server",
+            "maxPlayers": max_players,
+            "killLimit": kill_limit,
+            "playerCount": 0,
+            "createdAt": str(now),
+            "expiresAt": expires_at,
+            "ttl": expires_at,
+            "guestRoom": True,
+        }
+        result = {
+            "roomCode": code,
+            "status": "waiting_for_server",
+            "maxPlayers": max_players,
+            "killLimit": kill_limit,
+            "expiresAt": expires_at,
+            "assignment": {
+                "status": "pending",
+                "reason": "player_join_required",
+            },
+        }
+        request_record = {
+            "roomCode": request_record_key,
+            "status": "IDEMPOTENCY",
+            "createdAt": str(now),
+            "requestHash": request_hash,
+            "response": result,
+            "expiresAt": now + IDEMPOTENCY_TTL_SECONDS,
+            "ttl": now + IDEMPOTENCY_TTL_SECONDS,
+        }
+        try:
+            client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": _table("rooms").name,
+                            "Item": _serialize_item(room),
+                            "ConditionExpression": "attribute_not_exists(roomCode)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": _table("rooms").name,
+                            "Item": _serialize_item(request_record),
+                            "ConditionExpression": "attribute_not_exists(roomCode)",
+                        }
+                    },
+                ]
+            )
+            return response(201, result)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+                raise
+            cached = _get_idempotent_response(key, request_hash, now)
+            if cached is not None:
+                return response(201, cached)
+            # A room-code collision is safe to retry; a failure unrelated to a
+            # collision or idempotency race is surfaced by the bounded retry.
+    raise ApiError(
+        503,
+        "room_code_unavailable",
+        "A room code could not be allocated. Retry with the same Idempotency-Key.",
+        retryable=True,
+    )
+
+
+def _room_expiry(room):
+    expiry = room.get("expiresAt", room.get("ttl"))
+    expiry = _integer(expiry)
+    if expiry is None:
+        raise RuntimeError("Room has no valid numeric expiry.")
+    return expiry
+
+
+def _matchmaking_enabled():
+    return os.environ.get("MATCHMAKING_ENABLED", "false").lower() == "true"
+
+
+def _available_servers(region, now):
+    query = {
+        "IndexName": "region-status-index",
+        "KeyConditionExpression": Key("region").eq(region) & Key("status").eq("READY"),
+    }
+    candidates = []
+    while True:
+        result = _table("servers").query(**query)
+        candidates.extend(
+            item
+            for item in result.get("Items", [])
+            if _integer(item.get("heartbeatExpiresAt")) is not None
+            and _integer(item.get("heartbeatExpiresAt")) > now
+            and _integer(item.get("reservedSlots")) is not None
+            and _integer(item.get("capacity")) is not None
+            and _integer(item.get("reservedSlots")) < _integer(item.get("capacity"))
+        )
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        query["ExclusiveStartKey"] = last_key
+    return sorted(
+        candidates,
+        key=lambda server: (
+            _integer(server["reservedSlots"]) / max(1, _integer(server["capacity"])),
+            server["serverId"],
+        ),
+    )
+
+
+def _allocate(region, idempotency_key, request_hash, now, room_code=None, server_id=None):
+    try:
+        cached = cached_reservation_response(
+            _table("rooms"),
+            _table("tickets"),
+            idempotency_key,
+            request_hash,
+            now,
+        )
+    except IdempotencyConflict as exc:
+        raise ApiError(409, "idempotency_conflict", str(exc)) from exc
+    if cached is not None:
+        return cached
+    if not _matchmaking_enabled():
+        raise ApiError(
+            503,
+            "matchmaking_disabled",
+            "Matchmaking is not enabled for this deployment.",
+            retryable=True,
+            assignmentStatus="unavailable",
+            ticket=None,
+        )
+
+    candidates = _available_servers(region, now)
+    if server_id:
+        candidates = [server for server in candidates if server.get("serverId") == server_id]
+    if not candidates:
+        raise ApiError(
+            503,
+            "no_servers_available",
+            "No healthy game server has available capacity.",
+            retryable=True,
+            assignmentStatus="unavailable",
+            ticket=None,
+        )
+
+    last_failure = None
+    for server in candidates:
+        try:
+            assignment = reserve_server_and_issue_ticket(
+                _table("servers").meta.client,
+                _table("rooms"),
+                _table("servers"),
+                _table("tickets"),
+                _table("reservations"),
+                server,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+                room_code=room_code,
+            )
+            return assignment
+        except IdempotencyConflict as exc:
+            raise ApiError(409, "idempotency_conflict", str(exc)) from exc
+        except ReservationUnavailable as exc:
+            last_failure = exc
+
+    raise ApiError(
+        503,
+        "no_servers_available",
+        "No healthy game server has available capacity.",
+        retryable=True,
+        assignmentStatus="unavailable",
+        ticket=None,
+    ) from last_failure
+
+
+def join_room(code, event, body, now=None):
+    normalized = code.upper()
+    if not ROOM_CODE_PATTERN.fullmatch(normalized):
+        raise ApiError(400, "invalid_room_code", "Room code must be six letters or digits.")
+    _strict_fields(body, set())
+    region = os.environ.get("AWS_REGION", "ap-south-1")
+    now = int(time.time()) if now is None else int(now)
+    key = _idempotency_key(event)
+    request_hash = _payload_hash(
+        "join-private-room",
+        {"roomCode": normalized, "region": region},
+    )
+    try:
+        cached = cached_reservation_response(
+            _table("rooms"),
+            _table("tickets"),
+            key,
+            request_hash,
+            now,
+        )
+    except IdempotencyConflict as exc:
+        raise ApiError(409, "idempotency_conflict", str(exc)) from exc
+    if cached is not None:
+        cached["roomCode"] = normalized
+        return response(200, cached)
+    room = _table("rooms").get_item(Key={"roomCode": normalized}).get("Item")
+    if not room:
+        raise ApiError(404, "room_not_found", "Room was not found.")
+    if _room_expiry(room) <= now:
+        raise ApiError(410, "room_expired", "Room has expired.")
+    if room.get("status") not in {"waiting_for_server", "open"}:
+        raise ApiError(409, "room_not_joinable", "Room is not open for joining.")
+    max_players = _integer(room.get("maxPlayers"))
+    player_count = _integer(room.get("playerCount"))
+    if (
+        max_players is None
+        or player_count is None
+        or not 2 <= max_players <= 10
+        or not 0 <= player_count <= max_players
+    ):
+        raise RuntimeError("Room has invalid capacity data.")
+    if player_count >= max_players:
+        raise ApiError(409, "room_full", "Room is full.")
+    assigned_server = room.get("serverId") if room.get("status") == "open" else None
+    try:
+        assignment = _allocate(
+            region,
+            key,
+            request_hash,
+            now,
+            room_code=normalized,
+            server_id=assigned_server,
+        )
+    except ApiError as exc:
+        if exc.code == "no_servers_available":
+            current_room = _table("rooms").get_item(
+                Key={"roomCode": normalized},
+                ConsistentRead=True,
+            ).get("Item")
+            if current_room is None:
+                raise ApiError(404, "room_not_found", "Room was not found.") from exc
+            if _room_expiry(current_room) <= now:
+                raise ApiError(410, "room_expired", "Room has expired.") from exc
+            current_max = _integer(current_room.get("maxPlayers"))
+            current_count = _integer(current_room.get("playerCount"))
+            if (
+                current_max is not None
+                and current_count is not None
+                and current_count >= current_max
+            ):
+                raise ApiError(409, "room_full", "Room is full.") from exc
+            if current_room.get("status") not in {"waiting_for_server", "open"}:
+                raise ApiError(409, "room_not_joinable", "Room is not open for joining.") from exc
+        raise
+    assignment["roomCode"] = normalized
+    return response(200, assignment)
+
+
+def quickplay(event, body, now=None):
+    _strict_fields(body, {"region"})
+    region = body.get("region", os.environ.get("AWS_REGION", "ap-south-1"))
+    if (
+        not isinstance(region, str)
+        or len(region) > 32
+        or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]", region)
+    ):
+        raise ApiError(400, "invalid_region", "region must be a valid AWS region identifier.")
+    key = _idempotency_key(event)
+    now = int(time.time()) if now is None else int(now)
+    request_hash = _payload_hash("quickplay", {"region": region})
+    assignment = _allocate(region, key, request_hash, now)
+    return response(200, assignment)
+
+
+def get_ticket_status(body, now=None):
+    _strict_fields(body, {"ticket"})
+    token = body.get("ticket")
+    if not isinstance(token, str) or not TICKET_PATTERN.fullmatch(token):
+        raise ApiError(400, "invalid_ticket", "ticket must be an opaque join-ticket token.")
+    current_time = int(time.time()) if now is None else int(now)
+    item = ticket_status(_table("tickets"), token, current_time)
+    if item is None:
+        raise ApiError(404, "ticket_not_found", "Ticket was not found.")
+    expires_at = item.get("expiresAt")
+    status = item.get("status")
+    expires_at = _integer(expires_at)
+    if expires_at is None:
+        raise RuntimeError("Ticket has no valid numeric expiry.")
+    if expires_at <= current_time:
+        status = "EXPIRED"
+    if status not in {"ISSUED", "CONSUMED", "EXPIRED"}:
+        raise RuntimeError("Ticket has an invalid status.")
+    return response(
+        200,
+        {
+            "ticketStatus": status.lower(),
+            "expiresAt": expires_at,
+        },
+    )
+
+
+def _trusted_server_id(event):
+    request_context = event.get("requestContext") or {}
+    authorizer = request_context.get("authorizer") or {}
+    iam = authorizer.get("iam") or {}
+    user_arn = iam.get("userArn")
+    role_name = os.environ.get("SERVER_ROLE_NAME")
+    account_id = os.environ.get("AWS_ACCOUNT_ID")
+    if not isinstance(user_arn, str) or not role_name or not account_id:
+        raise ApiError(403, "server_auth_required", "A trusted dedicated-server IAM identity is required.")
+    match = re.fullmatch(
+        rf"arn:aws:sts::{re.escape(account_id)}:assumed-role/"
+        rf"{re.escape(role_name)}/(i-[0-9a-f]{{8,17}})",
+        user_arn,
+    )
+    if not match or not SERVER_ID_PATTERN.fullmatch(match.group(1)):
+        raise ApiError(403, "server_auth_required", "The caller is not an authorized EC2 server instance.")
+    return match.group(1)
+
+
+def _generation(body):
+    generation = body.get("generation")
+    if not isinstance(generation, str) or not GENERATION_PATTERN.fullmatch(generation):
+        raise ApiError(400, "invalid_generation", "generation must be a UUID v4.")
+    return generation
+
+
+def _server_for_generation(server_id, generation):
+    server = _table("servers").get_item(
+        Key={"serverId": server_id},
+        ConsistentRead=True,
+    ).get("Item")
+    if not server or server.get("serverGeneration") != generation:
+        raise ApiError(409, "server_generation_mismatch", "The server registration is stale.")
+    return server
+
+
+def register_server(event, body, now=None):
+    server_id = _trusted_server_id(event)
+    _strict_fields(body, {"publicAddress", "gamePort", "capacity", "protocol"})
+    registration_key = _idempotency_key(event)
+    address = body.get("publicAddress")
+    port = body.get("gamePort")
+    capacity = body.get("capacity", 10)
+    protocol = body.get("protocol", "udp")
+    if not isinstance(address, str) or len(address) > 253:
+        raise ApiError(400, "invalid_public_address", "publicAddress must be a public IP or DNS hostname.")
+    try:
+        ip_address = ipaddress.ip_address(address)
+        address_is_public = ip_address.is_global
+    except ValueError:
+        address_is_public = bool(DNS_NAME_PATTERN.fullmatch(address)) and address.lower() != "localhost"
+    if not address_is_public:
+        raise ApiError(400, "invalid_public_address", "publicAddress must be a public IP or DNS hostname.")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ApiError(400, "invalid_game_port", "gamePort must be an integer from 1 to 65535.")
+    if type(capacity) is not int or not 2 <= capacity <= 10:
+        raise ApiError(400, "invalid_capacity", "capacity must be an integer from 2 to 10.")
+    if protocol != "udp":
+        raise ApiError(400, "invalid_protocol", "Only UDP game servers are supported.")
+
+    now = int(time.time()) if now is None else now
+    generation = str(uuid.uuid4())
+    match_id = str(uuid.uuid4())
+    registration_request_hash = _payload_hash(
+        "server-register",
+        {
+            "publicAddress": address,
+            "gamePort": port,
+            "capacity": capacity,
+            "protocol": protocol,
+        },
+    )
+    item = {
+        "serverId": server_id,
+        "serverGeneration": generation,
+        "matchId": match_id,
+        "region": os.environ.get("AWS_REGION", "ap-south-1"),
+        "publicAddress": address,
+        "gamePort": port,
+        "protocol": protocol,
+        "capacity": capacity,
+        "reservedSlots": 0,
+        "status": "STARTING",
+        "registeredAt": now,
+        "heartbeatExpiresAt": now + SERVER_HEARTBEAT_SECONDS,
+        "ttl": now + SERVER_TTL_SECONDS,
+        "registrationKeyHash": hashlib.sha256(registration_key.encode("ascii")).hexdigest(),
+        "registrationRequestHash": registration_request_hash,
+    }
+    try:
+        _table("servers").put_item(
+            Item=item,
+            ConditionExpression=(
+                "attribute_not_exists(serverId) OR heartbeatExpiresAt <= :now "
+                "OR #status = :stopped"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":now": now, ":stopped": "STOPPED"},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            existing = _table("servers").get_item(
+                Key={"serverId": server_id},
+                ConsistentRead=True,
+            ).get("Item")
+            key_hash = hashlib.sha256(registration_key.encode("ascii")).hexdigest()
+            if existing and existing.get("registrationKeyHash") == key_hash:
+                if existing.get("registrationRequestHash") != registration_request_hash:
+                    raise ApiError(
+                        409,
+                        "idempotency_conflict",
+                        "This registration key was reused with a different request.",
+                    ) from exc
+                return response(
+                    200,
+                    {
+                        "serverId": server_id,
+                        "serverGeneration": existing["serverGeneration"],
+                        "matchId": existing["matchId"],
+                        "status": existing["status"],
+                        "heartbeatExpiresAt": _integer(existing["heartbeatExpiresAt"]),
+                        "duplicate": True,
+                    },
+                )
+            raise ApiError(409, "server_already_registered", "This EC2 instance already has a live registration.") from exc
+        raise
+    return response(
+        201,
+        {
+            "serverId": server_id,
+            "serverGeneration": generation,
+            "matchId": match_id,
+            "status": "STARTING",
+            "heartbeatExpiresAt": item["heartbeatExpiresAt"],
+            "duplicate": False,
+        },
+    )
+
+
+def update_server_status(event, body, now=None):
+    server_id = _trusted_server_id(event)
+    _strict_fields(body, {"generation", "status"})
+    generation = _generation(body)
+    new_status = body.get("status")
+    if not isinstance(new_status, str) or new_status not in {"READY", "DRAINING", "STOPPED"}:
+        raise ApiError(400, "invalid_server_status", "status must be READY, DRAINING, or STOPPED.")
+    now = int(time.time()) if now is None else now
+    allowed_from = {
+        "READY": ("STARTING", "READY"),
+        "DRAINING": ("STARTING", "READY", "DRAINING"),
+        "STOPPED": ("STARTING", "READY", "DRAINING"),
+    }[new_status]
+    aliases = {"#status": "status"}
+    values = {":new": new_status, ":generation": generation}
+    previous = []
+    for index, status in enumerate(allowed_from):
+        name = f":old{index}"
+        values[name] = status
+        previous.append(name)
+    status_condition = f"#status IN ({', '.join(previous)})"
+    expression_values = {key: value for key, value in values.items()}
+    expression_values.update(
+        {
+            ":heartbeat": now + SERVER_HEARTBEAT_SECONDS,
+            ":ttl": now + SERVER_TTL_SECONDS,
+            ":now": now,
+        }
+    )
+    if new_status == "READY":
+        status_condition += " AND reservedSlots < capacity"
+    try:
+        updated = _table("servers").update_item(
+            Key={"serverId": server_id},
+            UpdateExpression=(
+                "SET #status = :new, heartbeatExpiresAt = :heartbeat, "
+                "ttl = :ttl, lastHeartbeatAt = :now"
+            ),
+            ConditionExpression=f"serverGeneration = :generation AND {status_condition}",
+            ExpressionAttributeNames=aliases,
+            ExpressionAttributeValues=expression_values,
+            ReturnValues="ALL_NEW",
+        ).get("Attributes", {})
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "server_state_conflict", "The server registration or status has changed.") from exc
+        raise
+    if new_status != "STOPPED":
+        reap_expired_reservations(
+            _table("reservations"),
+            _table("servers").meta.client,
+            _table("servers"),
+            _table("rooms"),
+            server_id,
+            generation,
+            now,
+        )
+    return response(
+        200,
+        {
+            "serverId": server_id,
+            "status": updated.get("status", new_status),
+            "heartbeatExpiresAt": _integer(updated.get("heartbeatExpiresAt")),
+        },
+    )
+
+
+def consume_ticket_for_server(event, body, now=None):
+    server_id = _trusted_server_id(event)
+    _strict_fields(body, {"ticket", "generation"})
+    token = body.get("ticket")
+    if not isinstance(token, str) or not TICKET_PATTERN.fullmatch(token):
+        raise ApiError(400, "invalid_ticket", "ticket must be an opaque join-ticket token.")
+    generation = _generation(body)
+    server = _server_for_generation(server_id, generation)
+    if server.get("status") not in {"READY", "DRAINING"}:
+        raise ApiError(409, "server_not_active", "The game server is not accepting ticket consumption.")
+    consumed = consume_join_ticket(
+        _table("tickets").meta.client,
+        _table("tickets"),
+        _table("reservations"),
+        token,
+        server_id,
+        generation,
+        int(time.time()) if now is None else now,
+    )
+    if consumed is None:
+        raise ApiError(409, "ticket_invalid_or_consumed", "Ticket is expired, already consumed, or bound to another server.")
+    return response(
+        200,
+        {
+            "reservationId": consumed["reservationId"],
+            "matchId": consumed["matchId"],
+            "roomCode": consumed.get("roomCode"),
+            "consumed": True,
+        },
+    )
+
+
+def release_server_slot(event, reservation_id, body, now=None):
+    server_id = _trusted_server_id(event)
+    _strict_fields(body, {"generation"})
+    generation = _generation(body)
+    _server_for_generation(server_id, generation)
+    if not isinstance(reservation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", reservation_id):
+        raise ApiError(400, "invalid_reservation_id", "reservationId is invalid.")
+    try:
+        released = release_reservation(
+            _table("servers").meta.client,
+            _table("reservations"),
+            _table("servers"),
+            _table("rooms"),
+            reservation_id,
+            server_id,
+            generation,
+            int(time.time()) if now is None else now,
+        )
+    except ReservationNotFound as exc:
+        raise ApiError(404, "reservation_not_found", "Reservation was not found for this server.") from exc
+    except ReservationUnavailable as exc:
+        raise ApiError(409, "reservation_state_conflict", "Reservation state changed; retry safely.") from exc
+    return response(200, {"reservationId": reservation_id, "released": released})
+
+
+def _result_payload(body):
+    _strict_fields(body, {"generation", "winnerTeam", "teamScores", "durationSeconds", "players"})
+    generation = _generation(body)
+    winner = body.get("winnerTeam")
+    scores = body.get("teamScores")
+    duration = body.get("durationSeconds")
+    players = body.get("players")
+    if type(winner) is not int or winner not in (0, 1):
+        raise ApiError(400, "invalid_winner", "winnerTeam must be 0 or 1.")
+    if (
+        not isinstance(scores, list)
+        or len(scores) != 2
+        or any(type(score) is not int or not 0 <= score <= 200 for score in scores)
+    ):
+        raise ApiError(400, "invalid_team_scores", "teamScores must contain two integers from 0 to 200.")
+    if scores[winner] < scores[1 - winner]:
+        raise ApiError(400, "invalid_winner", "winnerTeam must have the higher team score.")
+    if type(duration) is not int or not 1 <= duration <= 7200:
+        raise ApiError(400, "invalid_duration", "durationSeconds must be from 1 to 7200.")
+    if not isinstance(players, list) or len(players) > 10:
+        raise ApiError(400, "invalid_players", "players must be an array containing at most 10 entries.")
+    seen_player_ids = set()
+    clean_players = []
+    for player in players:
+        if not isinstance(player, dict):
+            raise ApiError(400, "invalid_player", "Each players entry must be an object.")
+        _strict_fields(player, {"playerId", "team", "kills", "deaths"})
+        player_id = player.get("playerId")
+        team = player.get("team")
+        kills = player.get("kills")
+        deaths = player.get("deaths")
+        if not isinstance(player_id, str) or not 1 <= len(player_id) <= 64:
+            raise ApiError(400, "invalid_player_id", "playerId must contain 1 to 64 characters.")
+        if player_id in seen_player_ids:
+            raise ApiError(400, "duplicate_player_id", "players must not contain duplicate playerId values.")
+        if type(team) is not int or team not in (0, 1):
+            raise ApiError(400, "invalid_player_team", "Each player team must be 0 or 1.")
+        if type(kills) is not int or not 0 <= kills <= 200:
+            raise ApiError(400, "invalid_player_kills", "Each player kills value must be from 0 to 200.")
+        if type(deaths) is not int or not 0 <= deaths <= 200:
+            raise ApiError(400, "invalid_player_deaths", "Each player deaths value must be from 0 to 200.")
+        seen_player_ids.add(player_id)
+        clean_players.append(
+            {"playerId": player_id, "team": team, "kills": kills, "deaths": deaths}
+        )
+    return {
+        "generation": generation,
+        "winnerTeam": winner,
+        "teamScores": scores,
+        "durationSeconds": duration,
+        "players": clean_players,
+    }
+
+
+def submit_match_results(event, match_id, body, now=None):
+    server_id = _trusted_server_id(event)
+    if not isinstance(match_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        match_id,
+    ):
+        raise ApiError(400, "invalid_match_id", "matchId must be a UUID v4.")
+    result = _result_payload(body)
+    generation = result["generation"]
+    server = _server_for_generation(server_id, generation)
+    if server.get("matchId") != match_id:
+        raise ApiError(403, "match_server_mismatch", "This match is not assigned to the authenticated server.")
+    request_hash = _payload_hash("match-result", result)
+    now = int(time.time()) if now is None else now
+    result_item = {
+        "matchId": match_id,
+        "serverId": server_id,
+        "serverGeneration": generation,
+        "resultHash": request_hash,
+        "winnerTeam": result["winnerTeam"],
+        "teamScores": result["teamScores"],
+        "durationSeconds": result["durationSeconds"],
+        "players": result["players"],
+        "verificationStatus": "server_reported",
+        "completedAt": now,
+        "ttl": now + 365 * 24 * 60 * 60,
+    }
+    matches = _table("matches")
+    existing = matches.get_item(Key={"matchId": match_id}, ConsistentRead=True).get("Item")
+    if existing:
+        if existing.get("serverId") == server_id and existing.get("resultHash") == request_hash:
+            return response(
+                200,
+                {"matchId": match_id, "accepted": True, "duplicate": True, "verificationStatus": "server_reported"},
+            )
+        raise ApiError(409, "match_already_submitted", "A different result has already been recorded for this match.")
+    serializer = TypeSerializer()
+    serialize = lambda item: {key: serializer.serialize(value) for key, value in item.items()}
+    try:
+        matches.meta.client.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": matches.name,
+                        "Item": serialize(result_item),
+                        "ConditionExpression": "attribute_not_exists(matchId)",
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": _table("servers").name,
+                        "Key": serialize({"serverId": server_id}),
+                        "UpdateExpression": "SET #status = :draining",
+                        "ConditionExpression": (
+                            "serverGeneration = :generation AND matchId = :match "
+                            "AND #status IN (:ready, :draining)"
+                        ),
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": serialize(
+                            {
+                                ":generation": generation,
+                                ":match": match_id,
+                                ":draining": "DRAINING",
+                                ":ready": "READY",
+                            }
+                        ),
+                    }
+                },
+            ]
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+            raise
+        existing = matches.get_item(Key={"matchId": match_id}, ConsistentRead=True).get("Item")
+        if existing and existing.get("serverId") == server_id and existing.get("resultHash") == request_hash:
+            return response(
+                200,
+                {"matchId": match_id, "accepted": True, "duplicate": True, "verificationStatus": "server_reported"},
+            )
+        raise ApiError(409, "match_result_conflict", "Match result could not be recorded in the current state.") from exc
+    return response(
+        201,
+        {"matchId": match_id, "accepted": True, "duplicate": False, "verificationStatus": "server_reported"},
+    )
+
+
+def leaderboard(event):
+    if os.environ.get("LEADERBOARD_ENABLED", "false").lower() != "true":
+        raise ApiError(
+            503,
+            "leaderboard_unavailable",
+            "The leaderboard is disabled until the sharded index has been backfilled.",
+            retryable=True,
+        )
+    params = event.get("queryStringParameters") or {}
+    limit_text = params.get("top", "20")
+    if not isinstance(limit_text, str) or not re.fullmatch(r"[0-9]{1,3}", limit_text):
+        raise ApiError(400, "invalid_top", "top must be an integer from 1 to 100.")
+    limit = int(limit_text)
+    if not 1 <= limit <= 100:
+        raise ApiError(400, "invalid_top", "top must be an integer from 1 to 100.")
+
+    items = []
+    for shard in range(LEADERBOARD_SHARDS):
+        result = _table("players").query(
+            IndexName="leaderboard-v2-index",
+            KeyConditionExpression=Key("leaderboardShard").eq(f"SHARD#{shard:02d}"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        items.extend(result.get("Items", []))
+
+    def stat(item, field):
+        value = _integer(item.get(field, 0))
+        if value is None or value < 0:
+            return 0
+        return value
+
+    players_public = sorted(
+        items,
+        key=lambda item: str(item.get("leaderboardSort", "")),
+        reverse=True,
+    )[:limit]
+    return response(
+        200,
+        {
+            "players": [
+                {
+                    "rank": rank,
+                    "displayName": str(player.get("displayName") or "Player")[:16],
+                    "kills": stat(player, "kills"),
+                    "deaths": stat(player, "deaths"),
+                }
+                for rank, player in enumerate(players_public, start=1)
+            ]
+        },
+    )
+
+
+def lambda_handler(event, context):
+    try:
+        method = (event.get("requestContext", {}).get("http") or {}).get("method")
+        path = event.get("rawPath", "/config")
+        params = event.get("pathParameters") or {}
+        if not method:
+            method = event.get("httpMethod", "GET")
+            path = event.get("path", path)
+
+        if method == "GET" and path == "/config":
+            return response(
+                200,
+                {
+                    "gameName": "ACC Shooter",
+                    "region": os.environ.get("AWS_REGION", "ap-south-1"),
+                    "protocol": "udp",
+                    "maxPlayersPerMatch": 10,
+                    "defaultKillLimit": 30,
+                    "features": {
+                        "guestRoomCreation": True,
+                        "privateRooms": False,
+                        "quickplay": _matchmaking_enabled(),
+                        "ticketStatus": True,
+                        "leaderboard": os.environ.get("LEADERBOARD_ENABLED", "false").lower() == "true",
+                        "googleSignIn": False,
+                    },
+                },
+            )
+
+        if method == "POST" and path == "/guest/rooms":
+            return create_room(event, _body_object(event))
+
+        if method == "POST" and path.startswith("/guest/rooms/") and path.endswith("/join"):
+            code = params.get("code")
+            if not code:
+                code = path.removeprefix("/guest/rooms/").removesuffix("/join").strip("/")
+            if not isinstance(code, str) or not code:
+                raise ApiError(400, "room_code_required", "Room code is required.")
+            return join_room(code, event, _body_object(event))
+
+        if method == "POST" and path == "/guest/quickplay":
+            return quickplay(event, _body_object(event))
+
+        if method == "POST" and path == "/guest/tickets/status":
+            return get_ticket_status(_body_object(event))
+
+        if method == "POST" and path == "/internal/servers/register":
+            return register_server(event, _body_object(event))
+
+        if method == "POST" and path == "/internal/servers/heartbeat":
+            return update_server_status(event, _body_object(event))
+
+        if method == "POST" and path == "/internal/tickets/consume":
+            return consume_ticket_for_server(event, _body_object(event))
+
+        if method == "POST" and path.startswith("/internal/servers/reservations/") and path.endswith("/release"):
+            reservation_id = params.get("reservationId")
+            if not reservation_id:
+                reservation_id = path.removeprefix("/internal/servers/reservations/").removesuffix("/release").strip("/")
+            return release_server_slot(event, reservation_id, _body_object(event))
+
+        if method == "POST" and path.startswith("/internal/matches/") and path.endswith("/results"):
+            match_id = params.get("matchId")
+            if not match_id:
+                match_id = path.removeprefix("/internal/matches/").removesuffix("/results").strip("/")
+            return submit_match_results(event, match_id, _body_object(event))
+
+        if method == "GET" and path == "/leaderboard":
+            return leaderboard(event)
+
+        return _error(404, "route_not_found", "Route was not found.")
+    except ApiError as exc:
+        return _error(
+            exc.status,
+            exc.code,
+            exc.message,
+            exc.retryable,
+            **getattr(exc, "details", {}),
+        )
+    except Exception:
+        LOG.exception("Request failed", extra={"requestId": _request_id(event)})
+        return _error(
+            500,
+            "internal_error",
+            "The request could not be completed.",
+            retryable=True,
+        )

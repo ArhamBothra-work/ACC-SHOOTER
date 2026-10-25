@@ -1,0 +1,36 @@
+# Unity generated files and caches
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+
+# Local Unity editor preferences (usually machine/user-specific)
+# Uncomment the next line only if you decide not to track UserSettings:
+# [Uu]ser[Ss]ettings/
+
+# Build output
+[Bb]uild/
+[Bb]uilds/
+
+# IDE-generated files
+.vs/
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Visual Studio / Rider generated solution and project files
+*.csproj
+*.sln
+*.slnx
+*.user
+*.suo
+*.tmp
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
