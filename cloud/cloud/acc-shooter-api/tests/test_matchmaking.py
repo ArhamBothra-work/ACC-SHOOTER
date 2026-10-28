@@ -95,9 +95,124 @@ def test_reservation_transaction_contains_capacity_heartbeat_and_ticket_conditio
     server_update = operations[0]["Update"]
     ticket_put = operations[1]["Put"]
     assert "heartbeatExpiresAt > :now" in server_update["ConditionExpression"]
+    assert "attribute_type(reservedSlots, :number_type)" in server_update["ConditionExpression"]
+    assert "reservedSlots = :current_slots" in server_update["ConditionExpression"]
+    assert "reservedSlots + " not in server_update["UpdateExpression"]
+    assert server_update["UpdateExpression"] == "SET reservedSlots = :new_slots"
+    assert server_update["ExpressionAttributeValues"][":number_type"] == {"S": "N"}
+    assert server_update["ExpressionAttributeValues"][":current_slots"] == {"N": "0"}
+    assert server_update["ExpressionAttributeValues"][":new_slots"] == {"N": "1"}
     assert "reservedSlots < capacity" in server_update["ConditionExpression"]
     assert "#status = :ready" in server_update["ConditionExpression"]
     assert ticket_put["ConditionExpression"] == "attribute_not_exists(ticketId)"
+
+
+def test_non_numeric_slot_counter_is_rejected_by_reservation_transaction_guard():
+    tables = fake_tables()
+    candidate = ready_server()
+    persisted = ready_server()
+    persisted["reservedSlots"] = {"corrupt": 0}
+    tables.servers.items["server-1"] = persisted
+
+    with pytest.raises(matchmaking.ReservationUnavailable):
+        reserve(tables, server=candidate)
+
+    assert len(tables.client.transaction_requests) == 1
+    update = tables.client.transaction_requests[0][0]["Update"]
+    assert update["UpdateExpression"] == "SET reservedSlots = :new_slots"
+    assert "reservedSlots + " not in update["UpdateExpression"]
+    assert "attribute_type(reservedSlots, :number_type)" in update["ConditionExpression"]
+    assert update["ExpressionAttributeValues"][":number_type"] == {"S": "N"}
+    assert tables.servers.items["server-1"]["reservedSlots"] == {"corrupt": 0}
+    assert tables.tickets.items == {}
+    assert tables.reservations.items == {}
+
+
+def test_release_does_not_decrement_non_numeric_slot_counter():
+    tables = fake_tables()
+    server = ready_server()
+    server["reservedSlots"] = {"corrupt": 0}
+    tables.servers.items["server-1"] = server
+    tables.reservations.items["reservation-1"] = {
+        "reservationId": "reservation-1",
+        "serverId": "server-1",
+        "serverGeneration": server["serverGeneration"],
+        "matchId": server["matchId"],
+        "status": "RESERVED",
+        "ticketExpiresAt": 2000,
+    }
+
+    with pytest.raises(matchmaking.ReservationUnavailable):
+        matchmaking.release_reservation(
+            tables.client,
+            tables.reservations,
+            tables.servers,
+            tables.rooms,
+            "reservation-1",
+            "server-1",
+            server["serverGeneration"],
+            1000,
+        )
+
+    assert tables.reservations.items["reservation-1"]["status"] == "RESERVED"
+    assert tables.servers.items["server-1"]["reservedSlots"] == {"corrupt": 0}
+    decrement = tables.client.transaction_requests[0][1]["Update"]
+    assert decrement["UpdateExpression"] == "SET reservedSlots = :new_slots"
+    assert "reservedSlots - " not in decrement["UpdateExpression"]
+    assert "attribute_type(reservedSlots, :number_type)" in decrement["ConditionExpression"]
+
+
+def test_arithmetic_validation_error_is_mapped_to_reservation_unavailable():
+    tables = fake_tables()
+    tables.servers.items["server-1"] = ready_server()
+
+    def explode(TransactItems):
+        raise ClientError(
+            {
+                "Error": {
+                    "Code": "ValidationException",
+                    "Message": (
+                        "Invalid UpdateExpression: Incorrect operand type for operator "
+                        "or function; operator or function: +, operand type: M"
+                    ),
+                }
+            },
+            "TransactWriteItems",
+        )
+
+    tables.client.transact_write_items = explode
+    with pytest.raises(matchmaking.ReservationUnavailable, match="slot counter"):
+        reserve(tables)
+
+    assert tables.tickets.items == {}
+    assert tables.reservations.items == {}
+
+
+def test_distinct_requests_cannot_exceed_server_capacity():
+    tables = fake_tables()
+    server = ready_server()
+    server["capacity"] = 2
+    tables.servers.items["server-1"] = server
+    successes = []
+    failures = []
+
+    def run(index):
+        key = f"capacity-request-{index:04d}-xxxxxxxx"
+        try:
+            successes.append(reserve(tables, key=key, hash_value=key))
+        except matchmaking.ReservationUnavailable as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(successes) == 2
+    assert len(failures) == 4
+    assert tables.servers.items["server-1"]["reservedSlots"] == 2
+    assert len(tables.tickets.items) == len(tables.reservations.items) == 2
 
 
 def test_no_capacity_means_no_ticket_or_idempotency_reservation():

@@ -717,7 +717,7 @@ def update_server_status(event, body, now=None):
         "DRAINING": ("STARTING", "READY", "DRAINING"),
         "STOPPED": ("STARTING", "READY", "DRAINING"),
     }[new_status]
-    aliases = {"#status": "status"}
+    aliases = {"#status": "status", "#capacity": "capacity", "#ttl": "ttl"}
     values = {":new": new_status, ":generation": generation}
     previous = []
     for index, status in enumerate(allowed_from):
@@ -734,13 +734,13 @@ def update_server_status(event, body, now=None):
         }
     )
     if new_status == "READY":
-        status_condition += " AND reservedSlots < capacity"
+        status_condition += " AND reservedSlots < #capacity"
     try:
         updated = _table("servers").update_item(
             Key={"serverId": server_id},
             UpdateExpression=(
                 "SET #status = :new, heartbeatExpiresAt = :heartbeat, "
-                "ttl = :ttl, lastHeartbeatAt = :now"
+                "#ttl = :ttl, lastHeartbeatAt = :now"
             ),
             ConditionExpression=f"serverGeneration = :generation AND {status_condition}",
             ExpressionAttributeNames=aliases,
@@ -1108,3 +1108,4 @@ def lambda_handler(event, context):
             "The request could not be completed.",
             retryable=True,
         )
+

@@ -56,21 +56,46 @@ class FakeClient:
                 if table.name == "Servers":
                     expression = update["UpdateExpression"]
                     valid = existing is not None
-                    if "+" in expression:
-                        valid = valid and (
-                            existing.get("status") == "READY"
+                    reserved_slots = existing.get("reservedSlots") if existing else None
+                    numeric_slots = isinstance(reserved_slots, (int, Decimal)) and not isinstance(
+                        reserved_slots, bool
+                    )
+                    if "+" in expression or (
+                        "-" in expression and ":new_slots" not in values
+                    ):
+                        if existing is not None and not numeric_slots:
+                            raise self.operand_type_error("+" if "+" in expression else "-")
+                        condition = update["ConditionExpression"]
+                        valid = valid and numeric_slots and (
+                            "attribute_type(reservedSlots, :number_type)" in condition
+                            and values.get(":number_type") == "N"
+                            and existing.get("status") == "READY"
                             and existing.get("heartbeatExpiresAt", 0) > values[":now"]
-                            and existing.get("reservedSlots", 0) < existing.get("capacity", 0)
+                            and reserved_slots < existing.get("capacity", 0)
                             and existing.get("serverGeneration") == values.get(":generation")
                             and existing.get("matchId") == values.get(":match")
                             and existing.get("publicAddress")
                             and existing.get("gamePort")
                         )
-                    elif "-" in expression:
-                        valid = valid and (
-                            existing.get("serverGeneration") == values.get(":generation")
-                            and existing.get("reservedSlots", 0) >= values.get(":one", 0)
+                    elif ":new_slots" in values:
+                        condition = update["ConditionExpression"]
+                        valid = valid and numeric_slots and (
+                            "attribute_type(reservedSlots, :number_type)" in condition
+                            and values.get(":number_type") == "N"
+                            and reserved_slots == values.get(":current_slots")
+                            and existing.get("serverGeneration") == values.get(":generation")
                         )
+                        if ":ready" in values:
+                            valid = valid and (
+                                existing.get("status") == "READY"
+                                and existing.get("heartbeatExpiresAt", 0) > values[":now"]
+                                and reserved_slots < existing.get("capacity", 0)
+                                and existing.get("matchId") == values.get(":match")
+                                and existing.get("publicAddress")
+                                and existing.get("gamePort")
+                            )
+                        else:
+                            valid = valid and reserved_slots >= values.get(":one", 0)
                     else:
                         valid = valid and (
                             existing.get("serverGeneration") == values.get(":generation")
@@ -150,7 +175,12 @@ class FakeClient:
                 }
                 if table.name == "Servers":
                     expression = update["UpdateExpression"]
-                    if "+" in expression:
+                    if ":new_slots" in values:
+                        new_slots = values[":new_slots"]
+                        if isinstance(new_slots, Decimal) and new_slots == new_slots.to_integral_value():
+                            new_slots = int(new_slots)
+                        item["reservedSlots"] = new_slots
+                    elif "+" in expression:
                         item["reservedSlots"] = item.get("reservedSlots", 0) + values[":one"]
                     elif "-" in expression:
                         item["reservedSlots"] = item.get("reservedSlots", 0) - values[":one"]
@@ -187,6 +217,21 @@ class FakeClient:
     def cancelled():
         return ClientError(
             {"Error": {"Code": "TransactionCanceledException", "Message": "Condition failed"}},
+            "TransactWriteItems",
+        )
+
+    @staticmethod
+    def operand_type_error(operator):
+        return ClientError(
+            {
+                "Error": {
+                    "Code": "ValidationException",
+                    "Message": (
+                        "Invalid UpdateExpression: Incorrect operand type for operator "
+                        f"or function; operator or function: {operator}, operand type: M"
+                    ),
+                }
+            },
             "TransactWriteItems",
         )
 
@@ -797,6 +842,94 @@ def test_registration_and_heartbeat_require_the_authenticated_instance(monkeypat
     assert error_code(conflict) == "idempotency_conflict"
 
 
+def test_restart_registration_replaces_stopped_instance_with_new_address(monkeypatch, tables):
+    monkeypatch.setenv("SERVER_ROLE_NAME", "GameServerAgentRole")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    first = app.lambda_handler(
+        server_event(
+            "POST",
+            "/internal/servers/register",
+            {"publicAddress": "52.66.53.59", "gamePort": 7777, "capacity": 10},
+        ),
+        None,
+    )
+    old_registration = payload(first)
+    stopped = app.lambda_handler(
+        server_event(
+            "POST",
+            "/internal/servers/heartbeat",
+            {"generation": old_registration["serverGeneration"], "status": "STOPPED"},
+        ),
+        None,
+    )
+    assert stopped["statusCode"] == 200
+
+    restarted_request = server_event(
+        "POST",
+        "/internal/servers/register",
+        {"publicAddress": "13.127.204.73", "gamePort": 7777, "capacity": 10},
+    )
+    restarted_request["headers"]["Idempotency-Key"] = "server-restart-key-0002"
+    restarted = app.lambda_handler(restarted_request, None)
+
+    assert restarted["statusCode"] == 201
+    new_registration = payload(restarted)
+    assert new_registration["serverGeneration"] != old_registration["serverGeneration"]
+    assert new_registration["matchId"] != old_registration["matchId"]
+    record = tables.servers.items[new_registration["serverId"]]
+    assert record["publicAddress"] == "13.127.204.73"
+    assert record["status"] == "STARTING"
+    assert record["reservedSlots"] == 0
+
+
+def test_restart_registration_recovers_after_heartbeat_lease_expires(monkeypatch, tables):
+    monkeypatch.setenv("SERVER_ROLE_NAME", "GameServerAgentRole")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    monkeypatch.setattr(app.time, "time", lambda: 1000)
+    first = app.lambda_handler(
+        server_event(
+            "POST",
+            "/internal/servers/register",
+            {"publicAddress": "52.66.53.59", "gamePort": 7777, "capacity": 10},
+        ),
+        None,
+    )
+    old_registration = payload(first)
+    monkeypatch.setattr(app.time, "time", lambda: 1000 + app.SERVER_HEARTBEAT_SECONDS)
+
+    restarted_request = server_event(
+        "POST",
+        "/internal/servers/register",
+        {"publicAddress": "13.127.204.73", "gamePort": 7777, "capacity": 10},
+    )
+    restarted_request["headers"]["Idempotency-Key"] = "server-restart-key-0003"
+    restarted = app.lambda_handler(restarted_request, None)
+
+    assert restarted["statusCode"] == 201
+    assert payload(restarted)["serverGeneration"] != old_registration["serverGeneration"]
+    assert tables.servers.items[old_registration["serverId"]]["publicAddress"] == "13.127.204.73"
+
+
+def test_fresh_registration_key_does_not_replace_a_live_instance(monkeypatch, tables):
+    monkeypatch.setenv("SERVER_ROLE_NAME", "GameServerAgentRole")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    request = server_event(
+        "POST",
+        "/internal/servers/register",
+        {"publicAddress": "8.8.8.8", "gamePort": 7777, "capacity": 10},
+    )
+    first = app.lambda_handler(request, None)
+    original = payload(first)
+    retry = dict(request)
+    retry["headers"] = {"Idempotency-Key": "different-startup-key-0002"}
+
+    result = app.lambda_handler(retry, None)
+
+    assert result["statusCode"] == 409
+    assert error_code(result) == "server_already_registered"
+    assert tables.servers.items[original["serverId"]]["serverGeneration"] == original["serverGeneration"]
+
+
 def test_server_registration_validates_network_and_capacity(monkeypatch, tables):
     monkeypatch.setenv("SERVER_ROLE_NAME", "GameServerAgentRole")
     monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
@@ -841,6 +974,55 @@ def test_quickplay_assigns_one_slot_and_replays_same_ticket(monkeypatch, tables)
     assert tables.servers.items[_server_record()["serverId"]]["reservedSlots"] == 1
     assert len(tables.tickets.items) == len(tables.reservations.items) == 1
     assert tables.client.transactions == 1
+
+
+def test_quickplay_slot_type_change_before_transaction_is_unavailable(monkeypatch, tables):
+    monkeypatch.setenv("MATCHMAKING_ENABLED", "true")
+    server = _server_record()
+    tables.servers.items[server["serverId"]] = dict(server)
+
+    def available(region, now):
+        tables.servers.items[server["serverId"]] = {**server, "reservedSlots": {"corrupt": 0}}
+        return [dict(server)]
+
+    monkeypatch.setattr(app, "_available_servers", available)
+    result = app.lambda_handler(
+        event(
+            "POST",
+            "/guest/quickplay",
+            {},
+            {"Idempotency-Key": "quickplay-slot-type-race-01"},
+        ),
+        None,
+    )
+
+    assert result["statusCode"] == 503
+    assert error_code(result) == "no_servers_available"
+    assert tables.servers.items[server["serverId"]]["reservedSlots"] == {"corrupt": 0}
+    assert tables.tickets.items == {}
+    assert tables.reservations.items == {}
+
+
+def test_quickplay_skips_server_with_non_numeric_slot_counter(monkeypatch, tables):
+    monkeypatch.setenv("MATCHMAKING_ENABLED", "true")
+    server = _server_record()
+    server["reservedSlots"] = {"corrupt": 0}
+    tables.servers.items[server["serverId"]] = server
+
+    result = app.lambda_handler(
+        event(
+            "POST",
+            "/guest/quickplay",
+            {},
+            {"Idempotency-Key": "quickplay-corrupt-slots-01"},
+        ),
+        None,
+    )
+
+    assert result["statusCode"] == 503
+    assert error_code(result) == "no_servers_available"
+    assert tables.client.transactions == 0
+    assert tables.servers.items[server["serverId"]]["reservedSlots"] == {"corrupt": 0}
 
 
 def test_private_room_join_atomically_pins_server_and_capacity(monkeypatch, tables):

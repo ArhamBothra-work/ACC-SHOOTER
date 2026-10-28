@@ -14,6 +14,8 @@ A lightweight daemon that runs on the AWS EC2 dedicated game server host. It act
    - `GET /status`: Local diagnostic endpoint reporting agent and server status.
 5. **Graceful Shutdown**: Intercepts `SIGINT`/`SIGTERM` to mark the server `STOPPED` in DynamoDB and terminate the server process safely.
 
+If the Unity server process exits, the agent marks the registration `DRAINING`, stops refreshing its heartbeat, then marks it `STOPPED` during shutdown. With the provided systemd unit's `Restart=on-failure`, the agent is restarted and can register a new server generation. If the agent itself is terminated without running its shutdown handler, the registration remains unavailable until its 90-second heartbeat lease expires; the DynamoDB TTL is not the heartbeat lease.
+
 ## Configuration
 
 | Argument | Env Var | Default | Description |

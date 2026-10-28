@@ -27,6 +27,7 @@ from cloud.agent.agent import (
     SigV4HttpError,
     UnityServerSupervisor,
     get_imds_public_ip,
+    main,
 )
 
 
@@ -438,6 +439,100 @@ def test_agent_full_lifecycle(test_agent):
     )
     assert code == 403
     assert "Loopback access only" in non_loopback["error"]
+
+
+def test_heartbeat_loop_stops_after_unity_exit_without_further_heartbeats(test_agent):
+    assert test_agent.start() is True
+    test_agent.heartbeat_interval = 0.05
+    test_agent.api.heartbeat.side_effect = lambda generation, status: {
+        "serverId": test_agent.server_id,
+        "status": status,
+        "heartbeatExpiresAt": int(time.time()) + 90,
+    }
+    test_agent.supervisor = mock.Mock()
+    test_agent.supervisor.poll.return_value = 1
+    test_agent.api.heartbeat.reset_mock()
+
+    test_agent.run_heartbeat_loop()
+
+    assert test_agent.process_exit_code == 1
+    assert test_agent._stop_event.is_set()
+    assert [call.kwargs["status"] for call in test_agent.api.heartbeat.call_args_list] == ["DRAINING"]
+    assert test_agent.status == "DRAINING"
+
+
+def test_exited_game_process_stops_heartbeats_and_marks_registration_stopped(test_agent):
+    assert test_agent.start() is True
+    test_agent.api.heartbeat.side_effect = lambda generation, status: {
+        "serverId": test_agent.server_id,
+        "status": status,
+        "heartbeatExpiresAt": int(time.time()) + 90,
+    }
+    test_agent.supervisor = mock.Mock()
+    test_agent.supervisor.poll.return_value = 1
+
+    assert test_agent.heartbeat_cycle() is False
+    assert test_agent._stop_event.is_set()
+    assert test_agent.status == "DRAINING"
+    test_agent.stop()
+
+    assert [call.kwargs["status"] for call in test_agent.api.heartbeat.call_args_list] == [
+        "READY",
+        "DRAINING",
+        "STOPPED",
+    ]
+    assert test_agent.status == "STOPPED"
+
+
+def test_failed_ready_transition_marks_startup_registration_stopped():
+    api = mock.create_autospec(BackendApiClient, instance=True)
+    api.register.return_value = {
+        "serverId": "i-0123456789abcdef0",
+        "serverGeneration": "11111111-1111-4111-8111-111111111111",
+        "matchId": "22222222-2222-4222-8222-222222222222",
+        "status": "STARTING",
+    }
+    api.heartbeat.side_effect = [
+        RuntimeError("READY transition failed"),
+        {"status": "STOPPED"},
+    ]
+    supervisor = mock.Mock()
+    supervisor.start.return_value = True
+
+    with mock.patch("cloud.agent.agent.UnityServerSupervisor", return_value=supervisor):
+        agent = GameServerAgent(
+            api_url="https://mock.api.com",
+            region="ap-south-1",
+            public_address="52.95.110.1",
+            game_port=7777,
+            server_binary="/opt/acc/server",
+            loopback_port=0,
+            api_client=api,
+        )
+        assert agent.start() is False
+
+    supervisor.stop.assert_called_once()
+    assert [call.kwargs["status"] for call in api.heartbeat.call_args_list] == [
+        "READY",
+        "STOPPED",
+    ]
+    assert agent.status == "STOPPED"
+
+
+def test_unity_process_exit_returns_failure_for_systemd_restart():
+    agent = mock.Mock()
+    agent.local_test = False
+    agent.process_exit_code = None
+    agent.start.return_value = True
+    agent.run_heartbeat_loop.side_effect = lambda: setattr(agent, "process_exit_code", 1)
+
+    with mock.patch("cloud.agent.agent.parse_args", return_value=mock.Mock()), mock.patch(
+        "cloud.agent.agent.GameServerAgent",
+        return_value=agent,
+    ), mock.patch("cloud.agent.agent.signal.signal"):
+        assert main() == 1
+
+    agent.stop.assert_called_once()
 
 
 def test_unity_dedicated_server_validate_and_release(test_agent):

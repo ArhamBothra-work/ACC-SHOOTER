@@ -576,6 +576,7 @@ class GameServerAgent:
         self.status = "STARTING"
         self.running = False
         self._stop_event = threading.Event()
+        self.process_exit_code: Optional[int] = None
         self.client_reservations: Dict[str, str] = {}
 
     def resolve_public_address(self) -> str:
@@ -645,8 +646,7 @@ class GameServerAgent:
             )
             if not self.supervisor.start():
                 logger.error("Failed to launch Unity game server.")
-                if not self.local_test:
-                    self.api.heartbeat(generation=self.generation, status="STOPPED")
+                self._mark_stopped()
                 return False
         # Transition to READY (skip in local test)
         if not self.local_test:
@@ -658,6 +658,7 @@ class GameServerAgent:
                 logger.error("Failed initial READY heartbeat: %s", exc)
                 if self.supervisor:
                     self.supervisor.stop()
+                self._mark_stopped()
                 return False
         # Start Loopback Server (if port > 0)
         if self.loopback_port > 0:
@@ -687,14 +688,15 @@ class GameServerAgent:
             poll_res = self.supervisor.poll()
             if poll_res is not None:
                 logger.warning("Unity server process exited with code %s.", poll_res)
-                # Draining or stopping so matchmaking stops routing here
                 self.status = "DRAINING"
+                self.process_exit_code = poll_res
+                self._stop_event.set()
 
         try:
             hb = self.api.heartbeat(generation=self.generation, status=self.status)
             self.status = hb.get("status", self.status)
             logger.debug("Heartbeat OK: status=%s, expiresAt=%s", self.status, hb.get("heartbeatExpiresAt"))
-            return True
+            return self.process_exit_code is None
         except Exception as exc:
             logger.warning("Heartbeat update failed: %s", exc)
             return False
@@ -719,13 +721,7 @@ class GameServerAgent:
         if self.supervisor:
             self.supervisor.stop()
 
-        # Mark server STOPPED in backend (skip in local-test mode)
-        if self.generation and not self.local_test:
-            try:
-                self.api.heartbeat(generation=self.generation, status="STOPPED")
-                logger.info("Server marked STOPPED in backend.")
-            except Exception as exc:
-                logger.warning("Could not mark server STOPPED: %s", exc)
+        self._mark_stopped()
 
         # Shutdown loopback server
         if self.loopback_server:
@@ -734,6 +730,16 @@ class GameServerAgent:
                 self.loopback_server.server_close()
             except Exception as exc:
                 logger.debug("Error shutting down loopback server: %s", exc)
+
+    def _mark_stopped(self) -> None:
+        if not self.generation or self.local_test or self.status == "STOPPED":
+            return
+        try:
+            self.api.heartbeat(generation=self.generation, status="STOPPED")
+            self.status = "STOPPED"
+            logger.info("Server marked STOPPED in backend.")
+        except Exception as exc:
+            logger.warning("Could not mark server STOPPED: %s", exc)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -785,6 +791,9 @@ def main() -> int:
     try:
         if not agent.local_test:
             agent.run_heartbeat_loop()
+            if agent.process_exit_code is not None:
+                logger.error("Unity server exited; allowing systemd to restart the agent.")
+                return 1
         else:
             # In local‑test mode wait until the stop event is signaled.
             while not agent._stop_event.is_set():

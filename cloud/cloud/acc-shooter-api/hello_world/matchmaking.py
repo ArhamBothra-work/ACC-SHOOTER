@@ -26,6 +26,25 @@ def _serialize_item(item):
     return {key: serializer.serialize(value) for key, value in item.items()}
 
 
+def _nonnegative_integer(value):
+    if type(value) is int:
+        return value if value >= 0 else None
+    if (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and value == value.to_integral_value()
+        and value >= 0
+    ):
+        return int(value)
+    return None
+
+
+def _slot_operand_validation_error(exc):
+    error = exc.response.get("Error") or {}
+    message = error.get("Message") or ""
+    return error.get("Code") == "ValidationException" and "operand type" in message
+
+
 def _request_key(subject_id, idempotency_key):
     digest = hashlib.sha256(
         f"{subject_id}\0{idempotency_key}".encode("utf-8")
@@ -153,99 +172,121 @@ def reserve_server_and_issue_ticket(
         "ttl": now + 7 * 24 * 60 * 60,
     }
 
-    transaction = [
-        {
-            "Update": {
-                "TableName": servers_table.name,
-                "Key": _serialize_item({"serverId": server["serverId"]}),
-                "UpdateExpression": "SET reservedSlots = reservedSlots + :one",
-                "ConditionExpression": (
-                    "#status = :ready AND heartbeatExpiresAt > :now "
-                    "AND serverGeneration = :generation "
-                    "AND matchId = :match "
-                    "AND reservedSlots < capacity "
-                    "AND attribute_exists(publicAddress) AND attribute_exists(gamePort)"
-                ),
-                "ExpressionAttributeNames": {"#status": "status"},
-                "ExpressionAttributeValues": _serialize_item(
-                    {
-                        ":one": 1,
-                        ":ready": "READY",
-                        ":now": now,
-                        ":generation": server["serverGeneration"],
-                        ":match": server["matchId"],
-                    }
-                ),
-            }
-        },
-        {
-            "Put": {
-                "TableName": tickets_table.name,
-                "Item": _serialize_item(ticket),
-                "ConditionExpression": "attribute_not_exists(ticketId)",
-            }
-        },
-        {
-            "Put": {
-                "TableName": reservations_table.name,
-                "Item": _serialize_item(reservation),
-                "ConditionExpression": "attribute_not_exists(reservationId)",
-            }
-        },
-    ]
-    if room_code is not None:
-        transaction.append(
+    candidate = dict(server)
+    last_error = None
+    for _ in range(5):
+        reserved_slots = _nonnegative_integer(candidate.get("reservedSlots"))
+        if reserved_slots is None:
+            raise ReservationUnavailable("Server slot counter is not a nonnegative integer.")
+        transaction = [
             {
                 "Update": {
-                    "TableName": rooms_table.name,
-                    "Key": _serialize_item({"roomCode": room_code}),
-                    "UpdateExpression": (
-                        "SET #status = :open, serverId = :server, matchId = :match, "
-                        "serverGeneration = :generation ADD playerCount :one"
-                    ),
+                    "TableName": servers_table.name,
+                    "Key": _serialize_item({"serverId": candidate["serverId"]}),
+                    "UpdateExpression": "SET reservedSlots = :new_slots",
                     "ConditionExpression": (
-                        "expiresAt > :now AND playerCount < maxPlayers AND "
-                        "((#status = :waiting AND attribute_not_exists(serverId)) OR "
-                        "(#status = :open AND serverId = :server AND matchId = :match "
-                        "AND serverGeneration = :generation))"
+                        "#status = :ready AND heartbeatExpiresAt > :now "
+                        "AND serverGeneration = :generation "
+                        "AND matchId = :match "
+                        "AND attribute_type(reservedSlots, :number_type) "
+                        "AND reservedSlots = :current_slots "
+                        "AND reservedSlots < capacity "
+                        "AND attribute_exists(publicAddress) AND attribute_exists(gamePort)"
                     ),
                     "ExpressionAttributeNames": {"#status": "status"},
                     "ExpressionAttributeValues": _serialize_item(
                         {
-                            ":one": 1,
+                            ":new_slots": reserved_slots + 1,
+                            ":current_slots": reserved_slots,
+                            ":ready": "READY",
                             ":now": now,
-                            ":waiting": "waiting_for_server",
-                            ":open": "open",
-                            ":server": server["serverId"],
-                            ":match": server["matchId"],
-                            ":generation": server["serverGeneration"],
+                            ":generation": candidate["serverGeneration"],
+                            ":match": candidate["matchId"],
+                            ":number_type": "N",
                         }
                     ),
                 }
+            },
+            {
+                "Put": {
+                    "TableName": tickets_table.name,
+                    "Item": _serialize_item(ticket),
+                    "ConditionExpression": "attribute_not_exists(ticketId)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": reservations_table.name,
+                    "Item": _serialize_item(reservation),
+                    "ConditionExpression": "attribute_not_exists(reservationId)",
+                }
+            },
+        ]
+        if room_code is not None:
+            transaction.append(
+                {
+                    "Update": {
+                        "TableName": rooms_table.name,
+                        "Key": _serialize_item({"roomCode": room_code}),
+                        "UpdateExpression": (
+                            "SET #status = :open, serverId = :server, matchId = :match, "
+                            "serverGeneration = :generation ADD playerCount :one"
+                        ),
+                        "ConditionExpression": (
+                            "expiresAt > :now AND playerCount < maxPlayers AND "
+                            "((#status = :waiting AND attribute_not_exists(serverId)) OR "
+                            "(#status = :open AND serverId = :server AND matchId = :match "
+                            "AND serverGeneration = :generation))"
+                        ),
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": _serialize_item(
+                            {
+                                ":one": 1,
+                                ":now": now,
+                                ":waiting": "waiting_for_server",
+                                ":open": "open",
+                                ":server": candidate["serverId"],
+                                ":match": candidate["matchId"],
+                                ":generation": candidate["serverGeneration"],
+                            }
+                        ),
+                    }
+                }
+            )
+        transaction.append(
+            {
+                "Put": {
+                    "TableName": rooms_table.name,
+                    "Item": _serialize_item(request_record),
+                    "ConditionExpression": "attribute_not_exists(roomCode)",
+                }
             }
         )
-    transaction.append(
-        {
-            "Put": {
-                "TableName": rooms_table.name,
-                "Item": _serialize_item(request_record),
-                "ConditionExpression": "attribute_not_exists(roomCode)",
-            }
-        }
-    )
 
-    try:
-        ddb_client.transact_write_items(TransactItems=transaction)
-        return response
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
-            raise
-        cached = _cached_response(rooms_table, request_key, request_hash, now, tickets_table)
-        if cached is not None:
-            return cached
-        raise ReservationUnavailable(
-            "Server capacity, heartbeat, room capacity, or uniqueness condition failed."
-        ) from exc
+        try:
+            ddb_client.transact_write_items(TransactItems=transaction)
+            return response
+        except ClientError as exc:
+            last_error = exc
+            if _slot_operand_validation_error(exc):
+                raise ReservationUnavailable(
+                    "Server slot counter is not a nonnegative integer."
+                ) from exc
+            if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+                raise
+            cached = _cached_response(rooms_table, request_key, request_hash, now, tickets_table)
+            if cached is not None:
+                return cached
+            fresh = servers_table.get_item(
+                Key={"serverId": candidate["serverId"]},
+                ConsistentRead=True,
+            ).get("Item")
+            if not fresh:
+                break
+            candidate = dict(fresh)
+    raise ReservationUnavailable(
+        "Server capacity, heartbeat, room capacity, or uniqueness condition failed."
+    ) from last_error
 
 
 def consume_join_ticket(
@@ -394,19 +435,26 @@ def release_reservation(
             current_server
             and current_server.get("serverGeneration") == reservation.get("serverGeneration")
         ):
+            current_slots = _nonnegative_integer(current_server.get("reservedSlots"))
             transaction.append(
                 {
                     "Update": {
                         "TableName": servers_table.name,
                         "Key": _serialize_item({"serverId": server_id}),
-                        "UpdateExpression": "SET reservedSlots = reservedSlots - :one",
+                        "UpdateExpression": "SET reservedSlots = :new_slots",
                         "ConditionExpression": (
-                            "serverGeneration = :generation AND reservedSlots >= :one"
+                            "serverGeneration = :generation "
+                            "AND attribute_type(reservedSlots, :number_type) "
+                            "AND reservedSlots = :current_slots "
+                            "AND reservedSlots >= :one"
                         ),
                         "ExpressionAttributeValues": _serialize_item(
                             {
+                                ":new_slots": 0 if current_slots is None else max(current_slots - 1, 0),
+                                ":current_slots": 0 if current_slots is None else current_slots,
                                 ":one": 1,
                                 ":generation": reservation["serverGeneration"],
+                                ":number_type": "N",
                             }
                         ),
                     }
@@ -475,9 +523,13 @@ def release_reservation(
             ddb_client.transact_write_items(TransactItems=transaction)
             return True
         except ClientError as exc:
+            last_error = exc
+            if _slot_operand_validation_error(exc):
+                raise ReservationUnavailable(
+                    "Server slot counter is not a nonnegative integer."
+                ) from exc
             if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
                 raise
-            last_error = exc
             latest = reservations_table.get_item(
                 Key={"reservationId": reservation_id},
                 ConsistentRead=True,
