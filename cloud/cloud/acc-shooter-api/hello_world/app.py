@@ -60,6 +60,24 @@ class ApiError(Exception):
         self.details = details
 
 
+_ddb_client = None
+
+
+def _transaction_client():
+    """Low-level DynamoDB client for transact_write_items.
+
+    The transaction code pre-serializes values with TypeSerializer ({"N": "1"}).
+    A boto3 resource-level client (the one behind a Table object) serializes
+    Python values again, turning {"N": "1"} into a Map, and DynamoDB rejects it
+    ("Incorrect operand type ... operand type: M"). A plain
+    boto3.client("dynamodb") sends the pre-serialized values unchanged.
+    """
+    global _ddb_client
+    if _ddb_client is None:
+        _ddb_client = boto3.client("dynamodb")
+    return _ddb_client
+
+
 def _table(name):
     global _dynamodb
     if name not in _tables:
@@ -264,7 +282,7 @@ def create_room(event, body, now=None):
 
     expires_at = now + ROOM_TTL_SECONDS
     request_record_key = _idempotency_record_key(key)
-    client = _table("rooms").meta.client
+    client = _transaction_client()
 
     for _ in range(5):
         code = make_room_code()
@@ -417,7 +435,7 @@ def _allocate(region, idempotency_key, request_hash, now, room_code=None, server
     for server in candidates:
         try:
             assignment = reserve_server_and_issue_ticket(
-                _table("servers").meta.client,
+                _transaction_client(),
                 _table("rooms"),
                 _table("servers"),
                 _table("tickets"),
@@ -754,7 +772,7 @@ def update_server_status(event, body, now=None):
     if new_status != "STOPPED":
         reap_expired_reservations(
             _table("reservations"),
-            _table("servers").meta.client,
+            _transaction_client(),
             _table("servers"),
             _table("rooms"),
             server_id,
@@ -782,7 +800,7 @@ def consume_ticket_for_server(event, body, now=None):
     if server.get("status") not in {"READY", "DRAINING"}:
         raise ApiError(409, "server_not_active", "The game server is not accepting ticket consumption.")
     consumed = consume_join_ticket(
-        _table("tickets").meta.client,
+        _transaction_client(),
         _table("tickets"),
         _table("reservations"),
         token,
@@ -812,7 +830,7 @@ def release_server_slot(event, reservation_id, body, now=None):
         raise ApiError(400, "invalid_reservation_id", "reservationId is invalid.")
     try:
         released = release_reservation(
-            _table("servers").meta.client,
+            _transaction_client(),
             _table("reservations"),
             _table("servers"),
             _table("rooms"),
@@ -921,7 +939,7 @@ def submit_match_results(event, match_id, body, now=None):
     serializer = TypeSerializer()
     serialize = lambda item: {key: serializer.serialize(value) for key, value in item.items()}
     try:
-        matches.meta.client.transact_write_items(
+        _transaction_client().transact_write_items(
             TransactItems=[
                 {
                     "Put": {

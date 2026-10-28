@@ -396,6 +396,7 @@ def tables(monkeypatch):
         "matches": match_table,
     }
     monkeypatch.setattr(app, "_table", lookup.__getitem__)
+    monkeypatch.setattr(app, "_transaction_client", lambda: client)
     return SimpleNamespace(
         client=client,
         rooms=room_table,
@@ -1207,3 +1208,46 @@ def test_match_result_validation_rejects_duplicates_and_unknown_fields(monkeypat
     assert result["statusCode"] == 400
     assert error_code(result) == "duplicate_player_id"
     assert tables.matches.items == {}
+
+
+def test_transaction_client_sends_numbers_not_maps_on_the_wire(monkeypatch):
+    """Regression: pre-serialized values must reach DynamoDB as N/S, never as M.
+
+    Table(...).meta.client re-serializes {"N": "1"} into a Map, which DynamoDB
+    rejected as "Incorrect operand type ... operand type: M". This test uses the
+    real boto3 client that app.py hands to the transaction code and inspects the
+    request body; the request is aborted before any network call.
+    """
+    from boto3.dynamodb.types import TypeSerializer
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
+    monkeypatch.setattr(app, "_ddb_client", None)
+
+    client = app._transaction_client()
+    captured = {}
+
+    def capture(request, **kwargs):
+        captured["body"] = json.loads(request.body)
+        raise RuntimeError("stop before network")
+
+    client.meta.events.register("before-send.dynamodb.TransactWriteItems", capture)
+    serializer = TypeSerializer()
+    with pytest.raises(RuntimeError, match="stop before network"):
+        client.transact_write_items(
+            TransactItems=[
+                {
+                    "Update": {
+                        "TableName": "Servers",
+                        "Key": {"serverId": serializer.serialize("srv-1")},
+                        "UpdateExpression": "SET reservedSlots = :new_slots",
+                        "ExpressionAttributeValues": {":new_slots": serializer.serialize(1)},
+                    }
+                }
+            ]
+        )
+
+    update = captured["body"]["TransactItems"][0]["Update"]
+    assert update["Key"] == {"serverId": {"S": "srv-1"}}
+    assert update["ExpressionAttributeValues"][":new_slots"] == {"N": "1"}
